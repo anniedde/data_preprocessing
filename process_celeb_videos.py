@@ -12,6 +12,7 @@ from deepface import DeepFace
 import contextlib
 from random import shuffle
 import requests
+import torch
 import dlib
 import argparse
 import math
@@ -20,13 +21,14 @@ import tensorflow as tf
 from tensorflow import keras
 from tqdm import tqdm
 from facenet_pytorch import MTCNN
-import torch
 import multiprocessing
 from torchvision import transforms
 from torchvision.io import read_image
 from torchvision.utils import make_grid, save_image
 import multiprocessing
 from torchvision.transforms import functional as F
+import functools
+import imquality.brisque as brisque
 
 
 sys.path.append('/playpen-nas-ssd/awang/eg3d/ffhq')
@@ -37,6 +39,7 @@ def notify(message):
     user_id = '6712696502'
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={chat_id}&text={message}"
     requests.get(url).json() # this sends the message
+    print(message)
 
 celeb_video_map = {
     'Margot': ['https://www.youtube.com/watch?v=PP496qqtgg8',
@@ -48,7 +51,27 @@ celeb_video_map = {
                'https://www.youtube.com/watch?v=aCWD2g_glhM',
                'https://www.youtube.com/watch?v=8TEBL12U7W4',
                'https://www.youtube.com/watch?v=JeUFrZtKkn8',
-               'https://www.youtube.com/watch?v=YX5No8y31QQ'
+               'https://www.youtube.com/watch?v=YX5No8y31QQ',
+               'https://youtube.com/watch?v=AC2qbj_0zhs',
+                'https://youtube.com/watch?v=GmhcN130Fn8',
+                'https://youtube.com/watch?v=5vTDEj_bFh8',
+                'https://youtube.com/watch?v=xG_4Xtv5ANY',
+                'https://youtube.com/watch?v=XA89jSn_kmY',
+                'https://youtube.com/watch?v=gkpVfQBWwDA',
+                'https://youtube.com/watch?v=7R1SZg0d_NU',
+                'https://youtube.com/watch?v=k0a6t4oEgv8',
+                'https://youtube.com/watch?v=3pNg-T9_vyg',
+                'https://youtube.com/watch?v=ZGmmiuiVEnU',
+                'https://youtube.com/watch?v=xdAq0Nf1KNY',
+                'https://youtube.com/watch?v=J4RzAYzYOTo',
+                'https://youtube.com/watch?v=QrNk6lHyDbk',
+                'https://youtube.com/watch?v=-adsabO1gJo',
+                'https://youtube.com/watch?v=yvDz-F5V_qY',
+                'https://youtube.com/watch?v=qNZIJmEZ91g',
+                'https://youtube.com/watch?v=UtGrIh4n37w',
+                'https://youtube.com/watch?v=yKC7vOhr2vM',
+                'https://youtube.com/watch?v=GuWr-v3TOO8',
+                'https://youtube.com/watch?v=bukpOGl8syU',
                ],
     'Jennie': [
         'https://www.youtube.com/watch?v=UcXOaUThF2w&pp=ygUTYmxhY2twaW5rIGludGVydmlldw%3D%3D',
@@ -97,7 +120,24 @@ celeb_video_map = {
         'https://www.youtube.com/watch?v=IqNMZ-wuXJ8',
         'https://www.youtube.com/watch?v=fMFxXprEpCc',
         'https://www.youtube.com/watch?v=yJ2fKJ5iUjo'
-    ]
+    ],
+    'Sundar': [
+        'https://www.youtube.com/watch?v=gEDChDOM1_U&pp=ygUYc3VuZGFyIHBpY2hhaSBhZnRlcjoyMDE4',
+        'https://www.youtube.com/watch?v=X7vVP7F3-wM',
+        'https://www.youtube.com/watch?v=MJs-1QxWCbI',
+        'https://www.youtube.com/watch?v=ZdLRXoX3f3g',
+        'https://www.youtube.com/watch?v=n2RNcPRtAiY',
+        'https://www.youtube.com/watch?v=nCqEi1T0Mtk',
+        'https://www.youtube.com/watch?v=igYXPKctRyw',
+        'https://www.youtube.com/watch?v=7sncuRJtWQI',
+        'https://www.youtube.com/watch?v=CWTm0ccfZe4',
+        'https://www.youtube.com/watch?v=R8tBERK92kk'
+    ],
+    'Margot_up_to_5_wplus_greedy_fixedBuffer_5': ['x', 'x', 'x', 'x', 'x', 'x'],
+    'Margot_up_to_5_wplus': ['x', 'x', 'x', 'x', 'x', 'x'],
+    'Harry_wplus': ['x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x'],
+    'IU_wplus': ['x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x'],
+    'Margot_up_to_5_wplus_switched': ['x', 'x', 'x', 'x', 'x', 'x']
 }
 
 class FixedHeightResize:
@@ -115,7 +155,7 @@ def complete_func(stream, file_path):
 
 def download_videos(celeb):
     video_urls = celeb_video_map[celeb]
-    video_urls = sorted(video_urls, key=lambda x: YouTube(x).publish_date)
+    #video_urls = sorted(video_urls, key=lambda x: YouTube(x).publish_date)
 
     vid_dir = os.path.join('videos', celeb)
     if not os.path.isdir(vid_dir):
@@ -139,12 +179,20 @@ def extract_frames_video(celeb, video):
     output_folder = os.path.join(vid_dir, video.split('.')[0], 'frames')
     if not os.path.isdir(output_folder):
         os.makedirs(output_folder)
+    else:
+        return
 
     # Creating a VideoCapture object to read the video
     temp_cap = cv2.VideoCapture(video_path)
     length = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
     temp_cap.release()
-    interval = length // 12000 if length > 12000 else 1
+    interval = 1 #length // 10000 if length > 10000 else 1
+    vid_start = 0
+    vid_end = length
+
+    if length > 10000:
+        vid_start = length // 2 - 5000
+        vid_end = length // 2 + 5000
 
     # Function to extract frames from a given start and end index
     def extract_frames_chunk(start, end, video_path=video_path, output_folder=output_folder, interval=interval):
@@ -168,14 +216,14 @@ def extract_frames_video(celeb, video):
 
     # Determine the number of processes to use
     num_processes = 2
-    chunk_size = length // num_processes
+    chunk_size = (vid_end - vid_start) // num_processes
 
 
     # Create a list of process objects
     processes = []
     for i in range(num_processes):
-        start = i * chunk_size
-        end = start + chunk_size if i < num_processes - 1 else length
+        start = vid_start + i * chunk_size
+        end = start + chunk_size if i < num_processes - 1 else vid_end
         process = multiprocessing.Process(target=extract_frames_chunk, args=(start, end))
         processes.append(process)
 
@@ -239,7 +287,8 @@ def crop_frames_video(celeb, video):
     frame_dir = os.path.join(vid_dir, video, 'frames')
     cropped_frames_dir = os.path.join(vid_dir, video, 'cropped_frames')
     if os.path.isdir(cropped_frames_dir):
-        shutil.rmtree(cropped_frames_dir, ignore_errors=True)
+        notify(f'Frames already cropped for celeb: {celeb}, video: {video}')
+        return
     os.makedirs(cropped_frames_dir)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -249,10 +298,11 @@ def crop_frames_video(celeb, video):
         thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=False,
         device=device, keep_all=True
         )
-    batch_size = 20
+    batch_size = 40
     frames = []
     save_paths = []
     frames_list = sorted(os.listdir(frame_dir))
+    start_time = time.time()
     for j, frame in enumerate(tqdm(frames_list)):
         frame_path = os.path.join(frame_dir, frame)
         image = read_image(frame_path)
@@ -271,7 +321,9 @@ def crop_frames_video(celeb, video):
                 print(e)
             frames = []
         
-    notify(f'Finished cropping frames for {celeb} video {video}')
+    end_time = time.time()
+    execution_time_minutes = (end_time - start_time) / 60
+    notify(f'Finished cropping frames for {celeb} video {video}. Took {execution_time_minutes} minutes')
 
 def crop_frames(celeb):
     vid_dir = os.path.join('videos', celeb)
@@ -279,39 +331,49 @@ def crop_frames(celeb):
         crop_frames_video(celeb, video)
 
 def filter_frames_video(celeb, video, threshold=0.3):
+    notify(f'Starting filtering frames for {celeb} video {video}')
     vid_dir = os.path.join('videos', celeb)
-    sharp_frames_dir = os.path.join(vid_dir, video, 'sharp_frames')
+    eyes_open_dir = os.path.join(vid_dir, video, 'eyes_open_frames')
     selected_frames_dir = os.path.join(vid_dir, video, 'selected_frames')
-    if os.path.isdir(selected_frames_dir):
-        shutil.rmtree(selected_frames_dir, ignore_errors=True)
-    os.makedirs(selected_frames_dir)
+    if not os.path.isdir(selected_frames_dir):
+        os.makedirs(selected_frames_dir)
 
     lowest_distance = float('inf')
     lowest_distance_frame = None
     frames_list = []
 
-    for frame in tqdm(os.listdir(sharp_frames_dir)):
-        frame_path = os.path.join(sharp_frames_dir, frame)
-        #print('frame path: ', frame_path)
+    frames = os.listdir(eyes_open_dir)
+    shuffle(frames)
+    for frame in tqdm(frames):
+        frame_path = os.path.join(eyes_open_dir, frame)
         try:
-            verify = DeepFace.verify(frame_path, os.path.join(vid_dir, 'reference.png'),
-                                    model_name='ArcFace', detector_backend='yolov8', distance_metric='cosine')
-            distance = verify['distance']
-            frames_list.append((frame, distance))
-            if distance < threshold:
-                if not os.path.isfile(os.path.join(selected_frames_dir, frame)):
-                    shutil.copy(frame_path, os.path.join(selected_frames_dir, frame.replace('.png', f'_{distance:.2f}.png')))
-
-            if verify['distance'] < lowest_distance:
-                lowest_distance = verify['distance']
-                lowest_distance_frame = frame
+            reference_paths = []
+            reference_paths.append(os.path.join('references', f'{celeb}.png'))
+            if os.path.isdir(os.path.join(vid_dir, video, 'ref')):
+                for file in os.listdir(os.path.join(vid_dir, video, 'ref')):
+                    reference_paths.append(os.path.join(vid_dir, video, 'ref', file))
+            for reference_path in reference_paths:
+                verify = DeepFace.verify(frame_path, reference_path,
+                                        model_name='ArcFace', detector_backend='yolov8', distance_metric='cosine')
+                distance = verify['distance']
+                #frames_list.append((frame, distance))
+                if distance > 0.6:
+                    break
+                if distance < threshold:
+                    if not os.path.isfile(os.path.join(selected_frames_dir, frame)):
+                        shutil.copy(frame_path, os.path.join(selected_frames_dir, frame.replace('.png', f'_{distance:.2f}.png')))
+                    break
+                    
+                if verify['distance'] < lowest_distance:
+                    lowest_distance = verify['distance']
+                    lowest_distance_frame = frame
         except ValueError:
             continue
         except Exception as e:
             print('Error: ', e)
             notify(f'Error filtering {celeb} video {video}: {e}')
             traceback.print_exc()
-
+    """
     count = len(os.listdir(selected_frames_dir))
     frames_list = [x for x in frames_list if x[0] not in os.listdir(selected_frames_dir)]
     frames_list = sorted(frames_list, key=lambda x: x[1])
@@ -342,7 +404,7 @@ def filter_frames_video(celeb, video, threshold=0.3):
         frames_list = sorted(frames_list, key=lambda x: x[1])
         #for i, frame in enumerate(frames_list[:60]):
         #    shutil.copy(os.path.join(sharp_frames_dir, frame[0]), selected_frames_dir)
-    
+    """
     notify(f'Finished filtering frames for {celeb} video {video}. Found {len(os.listdir(selected_frames_dir))} frames.')
 
 def filter_frames(celeb):
@@ -376,51 +438,52 @@ def remove_closed_eyes_video(celeb, video, detector, predictor, reference_ratio)
     cropped_frames_dir = os.path.join(vid_dir, video, 'cropped_frames')
     eyes_open_dir = os.path.join(vid_dir, video, 'eyes_open_frames')
     
-    if os.path.isdir(eyes_open_dir):
-        shutil.rmtree(eyes_open_dir, ignore_errors=True)
-    os.makedirs(eyes_open_dir)
-    
-    # Get the list of frames
-    frames_list = sorted(os.listdir(cropped_frames_dir))
-    # Determine the maximum number of processes possible
-    max_processes = multiprocessing.cpu_count()
-    print('max_processes: ', max_processes)
-    #max_processes = 64
-
-
-    # Create a multiprocessing pool with the maximum number of processes
-    chunk_size = len(frames_list) // max_processes + 1
-    chunks = [frames_list[i:i+chunk_size] for i in range(0, len(frames_list), chunk_size)]
-
-    start = time.time()
-    # Process each chunk of frames in parallel
-    try:
+    if not os.path.isdir(eyes_open_dir):
+        os.makedirs(eyes_open_dir)
         
-        processes = []
-        for chunk in chunks:
-            p = multiprocessing.Process(target=remove_closed_eyes_frame, args=(chunk, reference_ratio, detector, predictor, cropped_frames_dir, eyes_open_dir, ))
-            p.start()
-            processes.append(p)
+        # Get the list of frames
+        frames_list = sorted(os.listdir(cropped_frames_dir))
+        # Determine the maximum number of processes possible
+        max_processes = multiprocessing.cpu_count()
+        print('max_processes: ', max_processes)
+        #max_processes = 64
 
-        # Join all the processes
-        for p in processes:
-            p.join()
+
+        # Create a multiprocessing pool with the maximum number of processes
+        chunk_size = len(frames_list) // max_processes + 1
+        chunks = [frames_list[i:i+chunk_size] for i in range(0, len(frames_list), chunk_size)]
+
+        start = time.time()
+        # Process each chunk of frames in parallel
+        try:
+            
+            processes = []
+            for chunk in chunks:
+                p = multiprocessing.Process(target=remove_closed_eyes_frame, args=(chunk, reference_ratio, detector, predictor, cropped_frames_dir, eyes_open_dir, ))
+                p.start()
+                processes.append(p)
+
+            # Join all the processes
+            for p in processes:
+                p.join()
+            
+            #pool.imap_unordered(remove_closed_eyes_frame, chunks)
+            #pool.map(remove_closed_eyes_frame, chunks)
+            
+        except Exception as e:
+            print('Error: ', e)
+            traceback.print_exc()
+
+        end = time.time()
+        print('total time: ', end - start)
+        #for i, frame in enumerate(tqdm(sorted(os.listdir(cropped_frames_dir)))):
+        #    remove_closed_eyes_frame(frame)
+
         
-        #pool.imap_unordered(remove_closed_eyes_frame, chunks)
-        #pool.map(remove_closed_eyes_frame, chunks)
-        
-    except Exception as e:
-        print('Error: ', e)
-        traceback.print_exc()
 
-    end = time.time()
-    print('total time: ', end - start)
-    #for i, frame in enumerate(tqdm(sorted(os.listdir(cropped_frames_dir)))):
-    #    remove_closed_eyes_frame(frame)
-
-    
-
-    notify(f'Finished removing closed eyes frames for {celeb} video {video}. Took {end - start} seconds')
+        notify(f'Finished removing closed eyes frames for {celeb} video {video}. Took {end - start} seconds')
+    else:
+        notify(f'Already removed closed eyes frames for {celeb} video {video}')
     
 def get_reference_ratio(celeb):
     detector = dlib.get_frontal_face_detector()
@@ -428,7 +491,8 @@ def get_reference_ratio(celeb):
 
     vid_dir = os.path.join('videos', celeb)
 
-    reference_pic = cv2.imread(os.path.join(vid_dir, 'reference.png'))
+    reference_pic = cv2.imread(os.path.join('references', f'{celeb}.png'))
+    assert reference_pic is not None
     reference_face = cv2.cvtColor(reference_pic, cv2.COLOR_BGR2RGB)
     dets = detector(reference_face, 1)
     reference_ratio = 1
@@ -448,7 +512,7 @@ def remove_closed_eyes(celeb):
 
     vid_dir = os.path.join('videos', celeb)
 
-    reference_pic = cv2.imread(os.path.join(vid_dir, 'reference.png'))
+    reference_pic = cv2.imread(os.path.join('references', f'{celeb}.png'))
     reference_face = cv2.cvtColor(reference_pic, cv2.COLOR_BGR2RGB)
     dets = detector(reference_face, 1)
     reference_ratio = 1
@@ -473,19 +537,18 @@ def remove_blurry_frame(frame_list, eyes_open_dir, sharp_frames_dir, threshold):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         fm = cv2.Laplacian(gray, cv2.CV_64F).var()
         if fm > threshold:
-            shutil.copy(frame_path, sharp_frames_dir)
+            shutil.copy(frame_path, os.path.join(sharp_frames_dir, frame.replace('.png', f'_{fm:.2f}.png')))
 
+        
 def remove_blurry_frames_video(celeb, video, threshold=50):
     vid_dir = os.path.join('videos', celeb)
-    eyes_open_dir = os.path.join(vid_dir, video, 'eyes_open_frames')
+    selected_dir = os.path.join(vid_dir, video, 'selected_frames')
     sharp_frames_dir = os.path.join(vid_dir, video, 'sharp_frames')
-    if os.path.isdir(sharp_frames_dir):
-        shutil.rmtree(sharp_frames_dir, ignore_errors=True)
-    os.makedirs(sharp_frames_dir)
+    if not os.path.isdir(sharp_frames_dir):
+        os.makedirs(sharp_frames_dir)
 
-    frames_list = sorted(os.listdir(eyes_open_dir))
+    frames_list = sorted(os.listdir(selected_dir))
     max_processes = multiprocessing.cpu_count() - 10
-    print('max_processes: ', max_processes)
 
     # Create a multiprocessing pool with the maximum number of processes
     chunk_size = len(frames_list) // max_processes + 1
@@ -496,7 +559,7 @@ def remove_blurry_frames_video(celeb, video, threshold=50):
     try:
         processes = []
         for chunk in chunks:
-            p = multiprocessing.Process(target=remove_blurry_frame, args=(chunk, eyes_open_dir, sharp_frames_dir, threshold, ))
+            p = multiprocessing.Process(target=remove_blurry_frame, args=(chunk, selected_dir, sharp_frames_dir, threshold, ))
             p.start()
             processes.append(p)
 
@@ -508,31 +571,91 @@ def remove_blurry_frames_video(celeb, video, threshold=50):
         print('Error: ', e)
         traceback.print_exc()
 
-    end = time.time() / 60
-    print('total time: ', end - start)
+    end = time.time()
+    print('total time: ', (end - start) / 60)
 
     notify(f'Finished removing blurry frames for {celeb} video {video}. Found {len(os.listdir(sharp_frames_dir))} frames.')
 
-def copy_to_final_subset_video(celeb, video):
+def decide_on_img(queue, save_dir, filters):
+    while True:
+        msg = queue.get()
+        if msg == 'END':
+            break
+
+        f = msg
+        try:
+            img = Image.open(f)
+        except:
+            continue
+
+        for filter in filters:
+            if filter(img) is False:
+                break
+        else:
+            shutil.copy2(f, save_dir)
+
+def quality_filter(img: Image.Image, quality_threshold: float = 45):
+    quality = brisque.score(img)
+    return quality < quality_threshold
+
+def filter_image_quality_video(celeb, video, threshold):
+    save_dir = os.path.join('videos', celeb, video, 'quality_frames')
+    if os.path.isdir(save_dir):
+        #shutil.rmtree(save_dir, ignore_errors=True)
+        print('Already filtered quality frames for video: ', video)
+        notify(f'Already filtered quality frames for video: {video}')
+        return
+    os.makedirs(save_dir)
+
+    src_dir = os.path.join('videos', celeb, video, 'selected_frames')
+    filters = [functools.partial(quality_filter, quality_threshold=threshold)]
+
+    queue = multiprocessing.Queue()
+    process = [None] * 20
+
+    for i in range(20):
+        p = multiprocessing.Process(target=decide_on_img, args=(queue, save_dir, filters))
+        p.daemon = True
+        p.start()
+        process[i] = p
+
+    print('Putting images in queue')
+    files = glob.glob(os.path.join(src_dir, '*.png'))
+    print('files: ', files)
+    shuffle(files)
+    for f in tqdm(files):
+        queue.put(f)
+
+    for _ in process:
+        queue.put('END')
+    try:
+        for p in process:
+            print(f'Joining on {p}')
+            p.join()
+    except Exception as e:
+        print('Error: ', e)
+        traceback.print_exc()
+
+def copy_to_final_auto_subset_video(celeb, video):
     vid_dir = os.path.join('videos', celeb)
-    dest_dir = os.path.join(vid_dir, video, 'final_subset')
+    dest_dir = os.path.join(vid_dir, video, 'final_auto_subset')
     selected_frames_dir = os.path.join(vid_dir, video, 'selected_frames')
-    """
+    
     if not os.path.isdir(dest_dir):
         os.makedirs(dest_dir)
-    selected_frames = os.listdir(selected_frames_dir)
-    shuffle(selected_frames)
-    for j, frame in enumerate(selected_frames[:40]):
-        try:
-            shutil.copy(os.path.join(selected_frames_dir, frame), os.path.join(dest_dir, frame))
-        except Exception as e:
-            print('Error: ', e)
-            traceback.print_exc()
-            break
-    """
-    tensors = []
-
+        selected_frames = os.listdir(selected_frames_dir)
+        shuffle(selected_frames)
+        for j, frame in enumerate(selected_frames):
+            try:
+                shutil.copy(os.path.join(selected_frames_dir, frame), os.path.join(dest_dir, frame))
+            except Exception as e:
+                print('Error: ', e)
+                traceback.print_exc()
+                break
+    else:
+        notify(f'Already copied frames to final auto subset folder for {celeb} video {video}. Found {len(os.listdir(dest_dir))} frames.')
     
+    tensors = []
 
     for file in os.listdir(dest_dir):
         image = read_image(os.path.join(dest_dir, file))
@@ -551,7 +674,7 @@ def copy_to_final_subset_video(celeb, video):
         os.makedirs(all_times_dest)
     save_image(grid, os.path.join(all_times_dest, f'{video}.png'))
 
-    notify(f'Finished copying frames to final subset folder for {celeb} video {video}')
+    notify(f'Finished copying frames to final auto subset folder for {celeb} video {video}')
 
 def copy_to_final_subset(celeb):
     vid_dir = os.path.join('videos', celeb)
@@ -563,10 +686,14 @@ def split_train_test_video(celeb, video):
     if not os.path.isdir(celeb):
         os.makedirs(celeb)
     final_subset_dir = os.path.join(vid_dir, video, 'final_subset')
-    dest_dir = os.path.join(celeb, video)
+    dest_dir = os.path.join('eg3d', celeb, video)
     for folder in ['all', 'train', 'test']:
         if os.path.isdir(os.path.join(dest_dir, folder)):
-            shutil.rmtree(os.path.join(dest_dir, folder), ignore_errors=True)
+            print('directory: ', os.path.join(dest_dir, folder))
+            print('Already split train test for video: ', video)
+            notify(f'Already split train test for video: {video}')
+            return
+            #shutil.rmtree(os.path.join(dest_dir, folder), ignore_errors=True)
         os.makedirs(os.path.join(dest_dir, folder))
     
     final_subset_videos = os.listdir(final_subset_dir)
@@ -585,6 +712,8 @@ def split_train_test_video(celeb, video):
     for k, test_frame in enumerate(test_frames):
         shutil.copy(os.path.join(dest_dir, 'all', test_frame), os.path.join(dest_dir, 'test', f'{k}.png'))
 
+    print('Finished splitting train test for video: ', video)
+
 def split_train_test():
     for celeb in os.listdir('videos'):
         vid_dir = os.path.join('videos', celeb)
@@ -602,7 +731,7 @@ def process_train_folder(celeb, video):
     for folder in folders:
         indir = os.path.join(root, year_folder, folder)
         cmd = f'python /playpen-nas-ssd/awang/eg3d/dataset_preprocessing/ffhq/preprocess_in_the_wild.py  \
-            --indir=/playpen-nas-ssd/awang/data/{indir}'
+            --indir=/playpen-nas-ssd/awang/data/eg3d/{indir}'
         print(cmd)
         os.system(cmd)
 
@@ -645,7 +774,7 @@ def extract_camera_params_celeb(celeb, video):
     folders = ['test', 'train']
 
     for folder in folders:
-        data_loc = os.path.join(root, year_folder, folder, 'preprocessed')
+        data_loc = os.path.join('eg3d', root, year_folder, folder, 'preprocessed')
         dataset_json_loc = data_loc + '/dataset.json'
 
         with open(dataset_json_loc) as f:
@@ -663,112 +792,124 @@ def extract_camera_params_celeb(celeb, video):
 
 # copy all photos from 0/train/preprocessed, 1/train/preprocessed, etc for years 0 through 9 to a folder named all but rename each photo 0_1.png, etc
 def copy_photos(celeb, video):
-    # make the all folder if it doesn't exist
-    if not os.path.exists(f'/playpen-nas-ssd/awang/data/{celeb}/all/train/preprocessed'):
-        os.makedirs(f'/playpen-nas-ssd/awang/data/{celeb}/all/train/preprocessed')
-
-    if not os.path.exists(f'/playpen-nas-ssd/awang/data/{celeb}/all/all'):
-        os.makedirs(f'/playpen-nas-ssd/awang/data/{celeb}/all/all')
     year = video
     for i in range(0, 20):
-        src = '/playpen-nas-ssd/awang/data/{}/{}/train/preprocessed/{}.png'.format(celeb, year, i)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_{}.png'.format(celeb, year, i)
-        dst_2 = '/playpen-nas-ssd/awang/data/{}/all/all/train_{}_{}.png'.format(celeb, year, i)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/{}.png'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_{}.png'.format(celeb, year, i)
+        dst_2 = '/playpen-nas-ssd/awang/data/eg3d/{}/all/all/train_{}_{}.png'.format(celeb, year, i)
         shutil.copyfile(src, dst)
         shutil.copyfile(src, dst_2)
-        src = '/playpen-nas-ssd/awang/data/{}/{}/train/preprocessed/{}_mirror.png'.format(celeb, year, i)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_{}_mirror.png'.format(celeb, year, i)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/{}_mirror.png'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_{}_mirror.png'.format(celeb, year, i)
+        dst_2 = '/playpen-nas-ssd/awang/data/eg3d/{}/all/all/train_{}_{}_mirror.png'.format(celeb, year, i)
         shutil.copyfile(src, dst)
+        shutil.copyfile(src, dst_2)
 
         # copy the latent codes too
-        src = '/playpen-nas-ssd/awang/data/{}/{}/train/preprocessed/{}_latent.npy'.format(celeb, year, i)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_{}_latent.npy'.format(celeb, year, i)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/{}_latent.npy'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_{}_latent.npy'.format(celeb, year, i)
+        dst_2 = '/playpen-nas-ssd/awang/data/eg3d/{}/all/all/train_{}_{}_latent.npy'.format(celeb, year, i)
         shutil.copyfile(src, dst)
-        src = '/playpen-nas-ssd/awang/data/{}/{}/train/preprocessed/{}_mirror_latent.npy'.format(celeb, year, i)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_{}_mirror_latent.npy'.format(celeb, year, i)
+        #shutil.copyfile(src, dst_2)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/{}_mirror_latent.npy'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_{}_mirror_latent.npy'.format(celeb, year, i)
+        dst_2 = '/playpen-nas-ssd/awang/data/eg3d/{}/all/all/train_{}_{}_mirror_latent.npy'.format(celeb, year, i)
+        shutil.copyfile(src, dst)
+        #shutil.copyfile(src, dst_2)
+
+        # copy the camera params too
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/{}.npy'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_{}.npy'.format(celeb, year, i)
+        shutil.copyfile(src, dst)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/{}_mirror.npy'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_{}_mirror.npy'.format(celeb, year, i)
         shutil.copyfile(src, dst)
 
 
 # same thing as copy_photos() but for the test folder and without latent codes
 def copy_test_photos(celeb, video):
-    # make the all folder if it doesn't exist
-    if not os.path.exists(f'/playpen-nas-ssd/awang/data/{celeb}/all/test/preprocessed'):
-        os.makedirs(f'/playpen-nas-ssd/awang/data/{celeb}/all/test/preprocessed')
-    if not os.path.exists(f'/playpen-nas-ssd/awang/data/{celeb}/all/all'):
-        os.makedirs(f'/playpen-nas-ssd/awang/data/{celeb}/all/all')
     year = video
     for i in range(0, 20):
-        src = '/playpen-nas-ssd/awang/data/{}/{}/test/preprocessed/{}.png'.format(celeb, year, i)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/test/preprocessed/{}_{}.png'.format(celeb, year, i)
-        dst_2 = '/playpen-nas-ssd/awang/data/{}/all/all/test_{}_{}.png'.format(celeb, year, i)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/test/preprocessed/{}.png'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_{}.png'.format(celeb, year, i)
+        dst_2 = '/playpen-nas-ssd/awang/data/eg3d/{}/all/all/test_{}_{}.png'.format(celeb, year, i)
         shutil.copyfile(src, dst)
         shutil.copyfile(src, dst_2)
-        src = '/playpen-nas-ssd/awang/data/{}/{}/test/preprocessed/{}_mirror.png'.format(celeb, year, i)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/test/preprocessed/{}_{}_mirror.png'.format(celeb, year, i)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/test/preprocessed/{}_mirror.png'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_{}_mirror.png'.format(celeb, year, i)
+        dst_2 = '/playpen-nas-ssd/awang/data/eg3d/{}/all/all/test_{}_{}_mirror.png'.format(celeb, year, i)
         shutil.copyfile(src, dst)
+        shutil.copyfile(src, dst_2)
+
+        # copy the camera params too
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/test/preprocessed/{}.npy'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_{}.npy'.format(celeb, year, i)
+        shutil.copyfile(src, dst)
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/test/preprocessed/{}_mirror.npy'.format(celeb, year, i)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_{}_mirror.npy'.format(celeb, year, i)
 
 # combine the dataset.json files from each year into one new dataset.json file in all, with the updated names of the photos from the above function
 # but keep the original dataset.json files in each year's folder the same
 def combine_dataset_json(celeb):
     # get the dataset.json file from each year
-    for year in range(0, 10):
-        src = '/playpen-nas-ssd/awang/data/{}/{}/train/preprocessed/dataset.json'.format(celeb, year)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_dataset.json'.format(celeb, year)
+    times = [x for x in os.listdir(os.path.join('eg3d', celeb)) if x.isdigit()]
+    for time in times:
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/train/preprocessed/dataset.json'.format(celeb, time)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_dataset.json'.format(celeb, time)
         shutil.copyfile(src, dst)
 
     # create the dataset.json file in all
     dataset = {}
     labels = []
     # update the names of the photos in the dataset.json file
-    for year in range(0, 10):
-        
+    for time in times:
         for i in range(0, 20):
             # get dataset.json file from each year
-            with open('/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_dataset.json'.format(celeb, year), 'r') as f:
+            with open('/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_dataset.json'.format(celeb, time), 'r') as f:
                 year_dataset = json.load(f)
                 year_labels = year_dataset['labels']
                 for label in year_labels:
                     img_name = label[0]
-                    label[0] = '{}_{}'.format(year, img_name)
+                    label[0] = '{}_{}'.format(time, img_name)
                 labels += year_labels
         # delete the year_dataset from the directory
-        os.remove('/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/{}_dataset.json'.format(celeb, year))
+        os.remove('/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/{}_dataset.json'.format(celeb, time))
     dataset['labels'] = labels
 
     # save the updated dataset.json file
-    with open('/playpen-nas-ssd/awang/data/{}/all/train/preprocessed/dataset.json'.format(celeb), 'w') as f:
+    with open('/playpen-nas-ssd/awang/data/eg3d/{}/all/train/preprocessed/dataset.json'.format(celeb), 'w') as f:
         json.dump(dataset, f)
     
 
 # same thing as combine_dataset_json() but for the test folder
 def combine_test_dataset_json(celeb):
     # get the dataset.json file from each year
-    for year in range(0, 10):
-        src = '/playpen-nas-ssd/awang/data/{}/{}/test/preprocessed/dataset.json'.format(celeb, year)
-        dst = '/playpen-nas-ssd/awang/data/{}/all/test/preprocessed/{}_dataset.json'.format(celeb, year)
+    times = [x for x in os.listdir(os.path.join('eg3d', celeb)) if x.isdigit()]
+    for time in times:
+        src = '/playpen-nas-ssd/awang/data/eg3d/{}/{}/test/preprocessed/dataset.json'.format(celeb, time)
+        dst = '/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_dataset.json'.format(celeb, time)
         shutil.copyfile(src, dst)
 
     # create the dataset.json file in all
     dataset = {}
     labels = []
     # update the names of the photos in the dataset.json file
-    for year in range(0, 10):
-        
+    for time in times:
         for i in range(0, 20):
             # get dataset.json file from each year
-            with open('/playpen-nas-ssd/awang/data/{}/all/test/preprocessed/{}_dataset.json'.format(celeb, year), 'r') as f:
+            with open('/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_dataset.json'.format(celeb, time), 'r') as f:
                 year_dataset = json.load(f)
                 year_labels = year_dataset['labels']
                 for label in year_labels:
                     img_name = label[0]
-                    label[0] = '{}_{}'.format(year, img_name)
+                    label[0] = '{}_{}'.format(time, img_name)
                 labels += year_labels
         # delete the year_dataset from the directory
-        os.remove('/playpen-nas-ssd/awang/data/{}/all/test/preprocessed/{}_dataset.json'.format(celeb, year))
+        os.remove('/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/{}_dataset.json'.format(celeb, time))
     dataset['labels'] = labels
 
     # save the updated dataset.json file
-    with open('/playpen-nas-ssd/awang/data/{}/all/test/preprocessed/dataset.json'.format(celeb), 'w') as f:
+    with open('/playpen-nas-ssd/awang/data/eg3d/{}/all/test/preprocessed/dataset.json'.format(celeb), 'w') as f:
         json.dump(dataset, f)
 
 def convert_dataset_json(folder_path):
@@ -803,8 +944,8 @@ def make_folders_for_images(folder):
                 #shutil.copy(os.path.join(folder, 'crop_1024', fileName), os.path.join(image_folder, fileName))
                 shutil.copy(os.path.join(folder, fileName), os.path.join(image_folder, fileName))
 
-def process_test_subfolders(celeb):
-    folder_path = celeb
+def process_test_subfolders(celeb, video):
+    folder_path = os.path.join('eg3d', celeb, str(video))
     # get all folders that lie in folder_path recursively named test
     for root, dirs, files in os.walk(folder_path):
         if 'test' in dirs:
@@ -821,43 +962,34 @@ def clean_up_folders(celeb):
             shutil.rmtree(os.path.join(vid_dir, video, 'frames'), ignore_errors=True)
 
 def run_funcs_before_project_latent_code(celeb, video):
-    #extract_frames_video(celeb, f'{video}.mp4')
-    #crop_frames_video(celeb, video)
-    #detector = dlib.get_frontal_face_detector()
-    #predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
-    #remove_closed_eyes_video(celeb, video, detector, predictor, get_reference_ratio(celeb))
+    extract_frames_video(celeb, f'{video}.mp4')
+    crop_frames_video(celeb, video)
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
+    remove_closed_eyes_video(celeb, video, detector, predictor, get_reference_ratio(celeb))
 
-    
-    threshold = 100
-    remove_blurry_frames_video(celeb, video)
-    while not os.path.exists(os.path.join('videos', celeb, video, 'sharp_frames')) or len(os.listdir(os.path.join('videos', celeb, video, 'sharp_frames'))) < 200:
-        remove_blurry_frames_video(celeb, video)
-        threshold -= 10
-    filter_frames_video(celeb, video)
-    if os.path.isdir(os.path.join('videos', celeb, video, 'final_subset')):
-        shutil.rmtree(os.path.join('videos', celeb, video, 'final_subset'), ignore_errors=True)
-    
-    copy_to_final_subset_video(celeb, video)
-    threshold = 40
-    while (len(os.listdir(os.path.join('videos', celeb, video, 'final_subset'))) < 41 and threshold > 0):
+    dist_thresh = 0.4
+    #shutil.rmtree(os.path.join('videos', celeb, video, 'selected_frames'), ignore_errors=True)
+    while not os.path.isdir(os.path.join('videos', celeb, video, 'selected_frames')) or len(os.listdir(os.path.join('videos', celeb, video, 'selected_frames'))) < 100:
+        filter_frames_video(celeb, video, dist_thresh)
+        dist_thresh += 0.02
+
+    threshold = 30
+    while not os.path.exists(os.path.join('videos', celeb, video, 'sharp_frames')) or len(os.listdir(os.path.join('videos', celeb, video, 'sharp_frames'))) < 60:
+        print('threshold: ', threshold)
         remove_blurry_frames_video(celeb, video, threshold)
-        threshold -= 5
-        filter_frames_video(celeb, video)
-        #shutil.rmtree(os.path.join('videos', celeb, video, 'final_subset'), ignore_errors=True)
-        copy_to_final_subset_video(celeb, video)
+        threshold -= 10
     
-    if len(os.listdir(os.path.join('videos', celeb, video, 'final_subset'))) < 41:
-        print('Still not enough frames after lowering blur threshold.')
-        dist_thresh = 0.35
-        while (len(os.listdir(os.path.join('videos', celeb, video, 'final_subset'))) < 41):
-            notify(f'Still not enough frames after lowering blur threshold for video {video}. Increasing distance threshold to {dist_thresh}')
-            filter_frames_video(celeb, video, dist_thresh)
-            dist_thresh += 0.01
-            copy_to_final_subset_video(celeb, video)
+    """
+    quality_thresh = 45
+    #shutil.rmtree(os.path.join('videos', celeb, video, 'quality_frames'), ignore_errors=True)
+    while not os.path.exists(os.path.join('videos', celeb, video, 'quality_frames')) or len(os.listdir(os.path.join('videos', celeb, video, 'quality_frames'))) < 40:
+        filter_image_quality_video(celeb, video, quality_thresh)
+        copy_to_final_auto_subset_video(celeb, video)
+        quality_thresh += 1
     
-    
-
-    copy_to_final_subset_video(celeb, video)
+    copy_to_final_auto_subset_video(celeb, video)
+    """
 
 def run_funcs_after_project_latent_code(celeb, video):
     #split_train_test_video(celeb, video)
@@ -866,6 +998,7 @@ def run_funcs_after_project_latent_code(celeb, video):
     #project_latent_codes(celeb, video)
     copy_photos(celeb, video)
     copy_test_photos(celeb, video)
+    process_test_subfolders(celeb, video)
 
 if __name__ == '__main__':
     #extract_frames()
@@ -894,12 +1027,16 @@ if __name__ == '__main__':
         #download_videos(celeb)
         if args.before:
             run_funcs_before_project_latent_code(celeb, video)
+            #copy_to_final_auto_subset_video(celeb, video)
         if args.after:
+            #process_train_folder(celeb, video)
+            #extract_camera_params_celeb(celeb, video)
             run_funcs_after_project_latent_code(celeb, video)
         
         
     except Exception as e:
         notify(f'Error processing {celeb}: {e}')
+        traceback.print_exc()
         exit()
 
     notify(f'Done processing {celeb} video {video}!')
